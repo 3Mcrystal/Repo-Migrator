@@ -77,9 +77,6 @@ int main() {
     system(addRemote.c_str());
     cout << "Remote 'origin' configuré vers : " << repoDestination << endl;
 
-    // =========================================================
-    // Étape 3 : Détection de la branche par défaut du remote
-    // =========================================================
     cout << "\n=== Étape 3 : Détection de la branche par défaut du remote ===" << endl;
 
     string cmdHead = "git ls-remote --symref " + repoDestination + " HEAD > remote_head.txt";
