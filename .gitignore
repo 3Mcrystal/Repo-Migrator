@@ -427,4 +427,4 @@ FodyWeavers.xsd
 *.msm
 *.msp
 
-/x64/
+.x64/
