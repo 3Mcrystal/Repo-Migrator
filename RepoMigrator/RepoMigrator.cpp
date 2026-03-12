@@ -1,169 +1,328 @@
 #include <iostream>
 #include <string>
-#include <cstdlib>
 #include <filesystem>
-#include <algorithm>
+#include <git2.h>
+#include <windows.h>
+#include <wincred.h>
+#pragma comment(lib, "Credui.lib")
+#pragma comment(lib, "git2.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "rpcrt4.lib")
+#pragma comment(lib, "crypt32.lib")
+
 
 using namespace std;
 namespace fs = std::filesystem;
 
-string readFileLine(const string& path) {
-    FILE* file = nullptr;
-    string line;
-    if (fopen_s(&file, path.c_str(), "r") == 0 && file) {
-        char buffer[256];
-        if (fgets(buffer, sizeof(buffer), file)) {
-            line = buffer;
-            line.erase(remove(line.begin(), line.end(), '\n'), line.end());
-            line.erase(remove(line.begin(), line.end(), '\r'), line.end());
-        }
-        fclose(file);
-    }
-    return line;
+// Displays the current libgit2 error
+void printGitError(const string& context) {
+	const git_error* e = git_error_last();
+	cerr << "[ERREUR] " << context;
+	if (e && e->message) {
+		cerr << " : " << e->message;
+	}
+	cerr << endl;
 }
 
-// Vérifie si une branche existe localement
-bool branchExists(const string& branch) {
-    string cmd = "git rev-parse --verify " + branch + " >nul 2>&1";
-    return system(cmd.c_str()) == 0;
+// Checks if a branch exists in the repository
+bool branchExists(git_repository* repo, const string& branchName) {
+	git_reference* ref = nullptr;
+	int result = git_branch_lookup(&ref, repo, branchName.c_str(), GIT_BRANCH_LOCAL);
+	if (ref) git_reference_free(ref);
+	return result == 0;
+}
+
+// Saves credentials in Windows Manager
+void saveCredentials(const string& target, const string& username, const string& password) {
+	CREDENTIALA cred = {};
+	cred.Type = CRED_TYPE_GENERIC;
+	cred.TargetName = const_cast<LPSTR>(target.c_str());
+	cred.UserName = const_cast<LPSTR>(username.c_str());
+	cred.CredentialBlob = reinterpret_cast<LPBYTE>(const_cast<char*>(password.c_str()));
+	cred.CredentialBlobSize = static_cast<DWORD>(password.size());
+	cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
+	CredWriteA(&cred, 0);
+}
+
+// Read credentials from Windows manager
+// Returns true if found, and fills in username/password
+bool loadCredentials(const string& target, string& username, string& password) {
+	PCREDENTIALA cred = nullptr;
+	if (CredReadA(target.c_str(), CRED_TYPE_GENERIC, 0, &cred)) {
+		username = cred->UserName ? cred->UserName : "";
+		password = string(reinterpret_cast<char*>(cred->CredentialBlob), cred->CredentialBlobSize);
+		CredFree(cred);
+		return true;
+	}
+	return false;
+}
+
+// libgit2 authentication callback
+// Search in the Windows manager
+// If absent, ask the user and save
+int credentialsCallback(git_credential** out, const char* url, const char* username_from_url,
+	unsigned int allowed_types, void* payload) {
+
+	// URL-based storage key (e.g., “git_transfer:https://github.com/user/repo.git”)
+	string target = string("git_transfer:") + url;
+
+	string username, password;
+
+	if (loadCredentials(target, username, password)) {
+		cout << "\nCredentials found in Windows Manager for: " << url << endl;
+	}
+	else {
+		cout << "\nAuthentication required for: " << url << endl;
+
+		if (username_from_url && strlen(username_from_url) > 0) {
+			username = username_from_url;
+			cout << "Username : " << username << endl;
+		}
+		else {
+			cout << "Username : ";
+			getline(cin, username);
+		}
+
+		cout << "Token / Password: ";
+		getline(cin, password);
+
+		saveCredentials(target, username, password);
+		cout << "Credentials saved in the Windows manager." << endl;
+	}
+
+	return git_credential_userpass_plaintext_new(out, username.c_str(), password.c_str());
 }
 
 int main() {
-    string repoSource;
-    string repoDestination;
+	string repoSource;
+	string repoDestination;
 
-    cout << "Entrez le chemin complet du depot source (local) : ";
-    getline(cin, repoSource);
+	cout << "Enter the full path to the source repository (local) : ";
+	getline(cin, repoSource);
 
-    cout << "Entrez l'URL (.git) du repo de destination (!VIDE!) : ";
-    getline(cin, repoDestination);
+	cout << "Enter the URL (.git) of the EMPTY destination repository: ";
+	getline(cin, repoDestination);
 
-    if (!fs::exists(repoSource)) {
-        cerr << "Le dossier source n'existe pas : " << repoSource << endl;
-        return 1;
-    }
+	if (!fs::exists(repoSource)) {
+		cerr << "[ERROR] The source file does not exist : " << repoSource << endl;
+		return 1;
+	}
 
-    fs::current_path(repoSource);
-    cout << "Repertoire courant : " << fs::current_path() << endl;
+	git_libgit2_init();
 
-    cout << "\n=== Étape 1 : Détection de la branche principale locale ===" << endl;
+	git_repository* repo = nullptr;
 
-    string localMainBranch;
-    if (branchExists("main")) {
-        localMainBranch = "main";
-    }
-    else if (branchExists("master")) {
-        localMainBranch = "master";
-    }
-    else {
-        // Fallback : on prend la branche courante
-        system("git symbolic-ref --short HEAD > current_branch.txt");
-        localMainBranch = readFileLine("current_branch.txt");
-        remove("current_branch.txt");
-        cout << "Aucune branche main/master trouvée, utilisation de la branche courante." << endl;
-    }
+	cout << "\n - Opening the local repo" << endl;
 
-    if (localMainBranch.empty()) {
-        cerr << "Impossible de détecter une branche principale locale." << endl;
-        return 1;
-    }
+	if (git_repository_open(&repo, repoSource.c_str()) != 0) {
+		printGitError("Unable to open the repository");
+		git_libgit2_shutdown();
+		return 1;
+	}
 
-    cout << "Branche principale locale : " << localMainBranch << endl;
+	cout << "Open repo : " << repoSource << endl;
 
-    cout << "\n=== Étape 2 : Configuration du remote ===" << endl;
+	cout << "\n - Step 1: Detecting the local main branch" << endl;
 
-    system("git remote remove origin >nul 2>&1");
+	string localMainBranch;
 
-    string addRemote = "git remote add origin " + repoDestination;
-    system(addRemote.c_str());
-    cout << "Remote 'origin' configuré vers : " << repoDestination << endl;
+	if (branchExists(repo, "main")) {
+		localMainBranch = "main";
+	}
+	else if (branchExists(repo, "master")) {
+		localMainBranch = "master";
+	}
+	else {
+		// Fallback : current branch
+		git_reference* headRef = nullptr;
+		if (git_repository_head(&headRef, repo) == 0) {
+			localMainBranch = git_reference_shorthand(headRef);
+			git_reference_free(headRef);
+			cout << "No main/master branch, use of the current branch." << endl;
+		}
+	}
 
-    cout << "\n=== Étape 3 : Détection de la branche par défaut du remote ===" << endl;
+	if (localMainBranch.empty()) {
+		cerr << "[ERROR] Unable to detect a local main branch." << endl;
+		git_repository_free(repo);
+		git_libgit2_shutdown();
+		return 1;
+	}
 
-    string cmdHead = "git ls-remote --symref " + repoDestination + " HEAD > remote_head.txt";
-    system(cmdHead.c_str());
+	cout << "Local main branch: " << localMainBranch << endl;
 
-    string remoteDefaultBranch;
-    {
-        FILE* file = nullptr;
-        if (fopen_s(&file, "remote_head.txt", "r") == 0 && file) {
-            char buffer[256];
-            while (fgets(buffer, sizeof(buffer), file)) {
-                string line = buffer;
-                if (line.rfind("ref:", 0) == 0) {
-                    size_t pos = line.find("refs/heads/");
-                    if (pos != string::npos) {
-                        remoteDefaultBranch = line.substr(pos + 11);
-                        remoteDefaultBranch.erase(remove(remoteDefaultBranch.begin(), remoteDefaultBranch.end(), '\n'), remoteDefaultBranch.end());
-                        remoteDefaultBranch.erase(remove(remoteDefaultBranch.begin(), remoteDefaultBranch.end(), '\r'), remoteDefaultBranch.end());
-                        break;
-                    }
-                }
-            }
-            fclose(file);
-        }
-    }
-    remove("remote_head.txt");
+	cout << "\n - Step 2: Remote configuration" << endl;
 
-    if (remoteDefaultBranch.empty()) {
-        cout << "Branche remote non détectée, utilisation de '" << localMainBranch << "'." << endl;
-        remoteDefaultBranch = localMainBranch;
-    }
+	git_remote_delete(repo, "origin");
 
-    cout << "Branche principale du remote : " << remoteDefaultBranch << endl;
+	git_remote* remote = nullptr;
+	if (git_remote_create(&remote, repo, "origin", repoDestination.c_str()) != 0) {
+		printGitError("Unable to create the remote");
+		git_repository_free(repo);
+		git_libgit2_shutdown();
+		return 1;
+	}
 
-    cout << "\n=== Étape 4 : Alignement de la branche principale ===" << endl;
+	cout << "Remote ‘origin’ configured to: " << repoDestination << endl;
 
-    if (localMainBranch != remoteDefaultBranch) {
-        cout << "Renommage de '" << localMainBranch << "' en '" << remoteDefaultBranch << "'..." << endl;
 
-        string renameCmd = "git branch -m " + localMainBranch + " " + remoteDefaultBranch;
-        if (system(renameCmd.c_str()) != 0) {
-            cerr << "Échec du renommage de la branche." << endl;
-            return 1;
-        }
+	cout << "\n - Step 3: Detecting the default branch of the remote" << endl;
 
-        localMainBranch = remoteDefaultBranch;
-    }
-    else {
-        cout << "Aucun renommage nécessaire." << endl;
-    }
+	git_remote_callbacks callbacks = GIT_REMOTE_CALLBACKS_INIT;
+	callbacks.credentials = credentialsCallback;
 
-    cout << "\n=== Étape 5 : Push de toutes les branches ===" << endl;
-    if (system("git push --all origin") != 0) {
-        cerr << "\nÉchec du push des branches." << endl;
-        cerr << "Le repo distant a peut-être un historique existant ou divergent." << endl;
+	string remoteDefaultBranch;
 
-        cout << "\nVoulez-vous forcer le push ? Cela écrasera définitivement l'historique distant." << endl;
-        cout << "[Y/n] ";
-        string confirmation;
-        getline(cin, confirmation);
+	git_remote_connect(remote, GIT_DIRECTION_FETCH, &callbacks, nullptr, nullptr);
 
-        if (confirmation != "Y"|| confirmation != "y") {
-            cerr << "Opération annulée." << endl;
-            return 1;
-        }
+	const git_remote_head** remoteHeads = nullptr;
+	size_t remoteHeadsCount = 0;
 
-        cout << "\nForce push en cours..." << endl;
-        if (system("git push --force --all origin") != 0) {
-            cerr << "Échec du force push. Vérifiez vos droits sur le repo distant." << endl;
-            return 1;
-        }
-    }
+	if (git_remote_ls(&remoteHeads, &remoteHeadsCount, remote) == 0) {
+		for (size_t i = 0; i < remoteHeadsCount; i++) {
+			string refName = remoteHeads[i]->name;
+			// HEAD symref -> refs/heads/xxx
+			if (remoteHeads[i]->symref_target != nullptr) {
+				string symref = remoteHeads[i]->symref_target;
+				const string prefix = "refs/heads/";
+				if (symref.find(prefix) == 0) {
+					remoteDefaultBranch = symref.substr(prefix.length());
+					break;
+				}
+			}
+		}
+	}
 
-    cout << "\n=== Étape 6 : Push des tags ===" << endl;
-    system("git push --tags origin");
+	git_remote_disconnect(remote);
 
-    cout << "\n=== Étape 7 : Configuration de l'upstream ===" << endl;
-    string upstreamCmd = "git push -u origin " + localMainBranch;
-    if (system(upstreamCmd.c_str()) != 0) {
-        cerr << "Échec de la configuration de l'upstream." << endl;
-        return 1;
-    }
+	if (remoteDefaultBranch.empty()) {
+		cout << "Remote branch not detected, using '" << localMainBranch << "'." << endl;
+		remoteDefaultBranch = localMainBranch;
+	}
 
-    cout << "\n=== Transfert terminé avec succès ! ===" << endl;
-    cout << "Nouveau dépôt : " << repoDestination << endl;
-    cout << "Branche principale : " << localMainBranch << endl;
+	cout << "Main branch of the remote: " << remoteDefaultBranch << endl;
 
-    return 0;
+	cout << "\n - Step 4: Main branch alignment" << endl;
+
+	if (localMainBranch != remoteDefaultBranch) {
+		cout << "Renaming '" << localMainBranch << "' to '" << remoteDefaultBranch << "'..." << endl;
+
+		git_reference* branchRef = nullptr;
+		if (git_branch_lookup(&branchRef, repo, localMainBranch.c_str(), GIT_BRANCH_LOCAL) != 0) {
+			printGitError("404 Branch not found");
+			git_remote_free(remote);
+			git_repository_free(repo);
+			git_libgit2_shutdown();
+			return 1;
+		}
+
+		git_reference* newBranchRef = nullptr;
+		if (git_branch_move(&newBranchRef, branchRef, remoteDefaultBranch.c_str(), 0) != 0) {
+			printGitError("Renaming failed");
+			git_reference_free(branchRef);
+			git_remote_free(remote);
+			git_repository_free(repo);
+			git_libgit2_shutdown();
+			return 1;
+		}
+
+		git_reference_free(branchRef);
+		git_reference_free(newBranchRef);
+		localMainBranch = remoteDefaultBranch;
+		cout << "Renaming completed." << endl;
+	}
+	else {
+		cout << "No renaming required" << endl;
+	}
+
+	cout << "\n - Step 5 : Push all branches" << endl;
+
+	//fetch all local branch
+	git_branch_iterator* branchIter = nullptr;
+	git_branch_iterator_new(&branchIter, repo, GIT_BRANCH_LOCAL);
+
+	git_strarray refspecs = {};
+	vector<string> refspecStrings;
+	vector<const char*> refspecPtrs;
+
+	git_reference* branchRef = nullptr;
+	git_branch_t branchType;
+
+	while (git_branch_next(&branchRef, &branchType, branchIter) == 0) {
+		const char* branchName = nullptr;
+		git_branch_name(&branchName, branchRef);
+		string refspec = string("refs/heads/") + branchName + ":refs/heads/" + branchName;
+		refspecStrings.push_back(refspec);
+		git_reference_free(branchRef);
+	}
+	git_branch_iterator_free(branchIter);
+
+	for (auto& s : refspecStrings) refspecPtrs.push_back(s.c_str());
+	refspecs.strings = const_cast<char**>(refspecPtrs.data());
+	refspecs.count = refspecPtrs.size();
+
+	git_push_options pushOpts = GIT_PUSH_OPTIONS_INIT;
+	pushOpts.callbacks.credentials = credentialsCallback;
+
+	int pushResult = git_remote_push(remote, &refspecs, &pushOpts);
+
+	if (pushResult != 0) {
+		const git_error* e = git_error_last();
+		cerr << "\n[ERROR] Push failed";
+		if (e && e->message) cerr << " : " << e->message;
+		cerr << endl;
+		cerr << "The remote repo may have an existing or divergent history." << endl;
+
+		cout << "\nDo you want to force the push? This will permanently overwrite the remote history." << endl;
+		cout << "[Y/n]";
+		string confirmation;
+		getline(cin, confirmation);
+
+		if (confirmation != "Y" && confirmation != "y") {
+			cerr << "Operation canceled" << endl;
+			git_remote_free(remote);
+			git_repository_free(repo);
+			git_libgit2_shutdown();
+			return 1;
+		}
+
+		vector<string> forceRefspecStrings;
+		vector<const char*> forceRefspecPtrs;
+		for (auto& s : refspecStrings) forceRefspecStrings.push_back("+" + s);
+		for (auto& s : forceRefspecStrings) forceRefspecPtrs.push_back(s.c_str());
+
+		git_strarray forceRefspecs = {};
+		forceRefspecs.strings = const_cast<char**>(forceRefspecPtrs.data());
+		forceRefspecs.count = forceRefspecPtrs.size();
+
+		cout << "\nForce push in progress..." << endl;
+		if (git_remote_push(remote, &forceRefspecs, &pushOpts) != 0) {
+			printGitError("Force push failed");
+			git_remote_free(remote);
+			git_repository_free(repo);
+			git_libgit2_shutdown();
+			return 1;
+		}
+	}
+	cout << "\n - Step 6 : Tag push" << endl;
+
+	git_strarray tagRefspecs = {};
+	const char* tagRefspec = "refs/tags/*:refs/tags/*";
+	tagRefspecs.strings = const_cast<char**>(&tagRefspec);
+	tagRefspecs.count = 1;
+
+	if (git_remote_push(remote, &tagRefspecs, &pushOpts) != 0) {
+		printGitError(" - Warning: tag push failed");
+	}
+
+	//cleanup
+	git_remote_free(remote);
+	git_repository_free(repo);
+	git_libgit2_shutdown();
+
+	cout << "\n - Transfer completed successfully!" << endl;
+	cout << "New Repo  : " << repoDestination << endl;
+	cout << "Main Branch : " << localMainBranch << endl;
+
+	return 0;
 }
