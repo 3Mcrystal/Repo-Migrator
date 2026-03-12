@@ -22,6 +22,7 @@ string readFileLine(const string& path) {
     return line;
 }
 
+// Vérifie si une branche existe localement
 bool branchExists(const string& branch) {
     string cmd = "git rev-parse --verify " + branch + " >nul 2>&1";
     return system(cmd.c_str()) == 0;
@@ -111,7 +112,6 @@ int main() {
 
     cout << "Branche principale du remote : " << remoteDefaultBranch << endl;
 
-
     cout << "\n=== Étape 4 : Alignement de la branche principale ===" << endl;
 
     if (localMainBranch != remoteDefaultBranch) {
@@ -131,13 +131,28 @@ int main() {
 
     cout << "\n=== Étape 5 : Push de toutes les branches ===" << endl;
     if (system("git push --all origin") != 0) {
-        cerr << "Échec du push des branches." << endl;
-        return 1;
+        cerr << "\nÉchec du push des branches." << endl;
+        cerr << "Le repo distant a peut-être un historique existant ou divergent." << endl;
+
+        cout << "\nVoulez-vous forcer le push ? Cela écrasera définitivement l'historique distant." << endl;
+        cout << "[Y/n] ";
+        string confirmation;
+        getline(cin, confirmation);
+
+        if (confirmation != "Y"|| confirmation != "y") {
+            cerr << "Opération annulée." << endl;
+            return 1;
+        }
+
+        cout << "\nForce push en cours..." << endl;
+        if (system("git push --force --all origin") != 0) {
+            cerr << "Échec du force push. Vérifiez vos droits sur le repo distant." << endl;
+            return 1;
+        }
     }
 
     cout << "\n=== Étape 6 : Push des tags ===" << endl;
     system("git push --tags origin");
-
 
     cout << "\n=== Étape 7 : Configuration de l'upstream ===" << endl;
     string upstreamCmd = "git push -u origin " + localMainBranch;
